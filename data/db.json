@@ -46,5 +46,19 @@
       "createdAt": "2026-06-16T00:00:00.000Z",
       "resolvedAt": null
     }
+  ],
+  "batches": [
+    {
+      "id": "batch_demo_1",
+      "tuneId": "tune_demo",
+      "startBeat": 1,
+      "endBeat": 32,
+      "widthMm": 70,
+      "beats": 32,
+      "lengthMm": 64,
+      "status": "issued",
+      "note": "开头主题卷带已领用切割",
+      "createdAt": "2026-06-16T00:00:00.000Z"
+    }
   ]
 }

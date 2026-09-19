@@ -4,6 +4,8 @@ const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
 const DB_FILE = path.join(__dirname, "data", "db.json");
+// 估算用：每拍约 2mm 纸带，登记领用时可用 lengthMm 覆盖
+const MM_PER_BEAT = 2;
 
 const initialData = {
   tunes: [
@@ -53,6 +55,20 @@ const initialData = {
       createdAt: new Date().toISOString(),
       resolvedAt: null
     }
+  ],
+  batches: [
+    {
+      id: "batch_demo_1",
+      tuneId: "tune_demo",
+      startBeat: 1,
+      endBeat: 32,
+      widthMm: 70,
+      beats: 32,
+      lengthMm: 64,
+      status: "issued",
+      note: "开头主题卷带已领用切割",
+      createdAt: new Date().toISOString()
+    }
   ]
 };
 
@@ -67,7 +83,10 @@ const routes = [
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
-  "PATCH /issues/:id/status"
+  "PATCH /issues/:id/status",
+  "GET /batches",
+  "POST /batches",
+  "GET /usage"
 ];
 
 async function ensureDb() {
@@ -81,7 +100,12 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  db.tunes ||= [];
+  db.sections ||= [];
+  db.issues ||= [];
+  db.batches ||= [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -134,20 +158,89 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+function issueBeatRange(db, issue) {
+  if (Number.isFinite(issue.beat)) return { start: issue.beat, end: issue.beat };
+  const section = db.sections.find((item) => item.id === issue.sectionId);
+  if (section) return { start: section.startBeat, end: section.endBeat };
+  return null;
+}
+
+// 无法定位拍点的问题按影响整首曲目保守处理
+function issueOverlapsRange(db, issue, startBeat, endBeat) {
+  const range = issueBeatRange(db, issue);
+  if (!range) return true;
+  return rangesOverlap(range.start, range.end, startBeat, endBeat);
+}
+
+function openIssues(db, tuneId) {
+  return db.issues.filter((item) => item.tuneId === tuneId && item.status !== "resolved");
+}
+
+// 领用后新增问题只把受影响批次置为待复核并保留旧记录；范围内问题全部解决后自动恢复已领用
+function refreshBatchStatuses(db, tuneId) {
+  const blocking = openIssues(db, tuneId);
+  for (const batch of db.batches.filter((item) => item.tuneId === tuneId)) {
+    const hasOpenIssue = blocking.some((issue) => issueOverlapsRange(db, issue, batch.startBeat, batch.endBeat));
+    if (hasOpenIssue && batch.status === "issued") {
+      batch.status = "pending_review";
+      batch.reviewRequestedAt = new Date().toISOString();
+    } else if (!hasOpenIssue && batch.status === "pending_review") {
+      batch.status = "issued";
+      batch.reviewedAt = new Date().toISOString();
+    }
+  }
+}
+
 function buildProgress(db, tuneId) {
   findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
   const issues = db.issues.filter((item) => item.tuneId === tuneId);
+  const batches = db.batches.filter((item) => item.tuneId === tuneId);
   const checkedCount = sections.filter((item) => item.checked).length;
-  const openIssues = issues.filter((item) => item.status !== "resolved").length;
+  const openCount = issues.filter((item) => item.status !== "resolved").length;
   return {
     tuneId,
     totalSections: sections.length,
     checkedSections: checkedCount,
     uncheckedSections: sections.length - checkedCount,
-    openIssues,
-    resolvedIssues: issues.length - openIssues,
-    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
+    openIssues: openCount,
+    resolvedIssues: issues.length - openCount,
+    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0,
+    batches: {
+      total: batches.length,
+      issued: batches.filter((item) => item.status === "issued").length,
+      pendingReview: batches.filter((item) => item.status === "pending_review").length,
+      issuedBeats: batches.reduce((sum, item) => sum + (item.beats || 0), 0),
+      issuedLengthMm: batches.reduce((sum, item) => sum + (item.lengthMm || 0), 0)
+    }
+  };
+}
+
+function buildUsage(db, tuneId) {
+  const batches = db.batches.filter((item) => !tuneId || item.tuneId === tuneId);
+  const byWidth = new Map();
+  for (const batch of batches) {
+    const key = String(batch.widthMm);
+    if (!byWidth.has(key)) {
+      byWidth.set(key, { widthMm: batch.widthMm, batches: 0, beats: 0, lengthMm: 0 });
+    }
+    const bucket = byWidth.get(key);
+    bucket.batches += 1;
+    bucket.beats += batch.beats || 0;
+    bucket.lengthMm += batch.lengthMm || 0;
+  }
+  return {
+    tuneId: tuneId || null,
+    totalBatches: batches.length,
+    issuedBatches: batches.filter((item) => item.status === "issued").length,
+    pendingReviewBatches: batches.filter((item) => item.status === "pending_review").length,
+    totalBeats: batches.reduce((sum, item) => sum + (item.beats || 0), 0),
+    totalLengthMm: batches.reduce((sum, item) => sum + (item.lengthMm || 0), 0),
+    byWidth: [...byWidth.values()]
   };
 }
 
@@ -228,6 +321,74 @@ async function handle(req, res) {
     return send(res, 200, { data: section });
   }
 
+  if (req.method === "GET" && pathname === "/batches") {
+    const tuneId = searchParams.get("tuneId");
+    const status = searchParams.get("status");
+    const batches = db.batches.filter((item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status));
+    return send(res, 200, { data: batches });
+  }
+
+  if (req.method === "POST" && pathname === "/batches") {
+    const body = await parseBody(req);
+    required(body, ["tuneId", "startBeat", "endBeat", "widthMm"]);
+    const tune = findTune(db, body.tuneId);
+    const startBeat = Number(body.startBeat);
+    const endBeat = Number(body.endBeat);
+    const widthMm = Number(body.widthMm);
+    if (!Number.isFinite(startBeat) || !Number.isFinite(endBeat) || startBeat < 1 || endBeat < startBeat) {
+      return send(res, 400, { error: "起止拍必须是正整数且起始拍不大于结束拍" });
+    }
+    if (!Number.isFinite(widthMm) || widthMm <= 0) {
+      return send(res, 400, { error: "纸带宽度必须是正数" });
+    }
+    if (body.lengthMm !== undefined && (!Number.isFinite(Number(body.lengthMm)) || Number(body.lengthMm) <= 0)) {
+      return send(res, 400, { error: "纸带长度必须是正数" });
+    }
+    // 整批校验：任一规则不满足即整批拒绝，原领用记录和进度不变
+    const reasons = [];
+    const specWidth = Number(tune.stripSpec && tune.stripSpec.widthMm);
+    if (Number.isFinite(specWidth) && widthMm !== specWidth) {
+      reasons.push(`纸带宽度${widthMm}mm与曲目规格${specWidth}mm不符`);
+    }
+    const overlapped = db.batches.filter(
+      (item) => item.tuneId === tune.id && rangesOverlap(startBeat, endBeat, item.startBeat, item.endBeat)
+    );
+    if (overlapped.length) {
+      reasons.push(`同一曲目区间重叠：${overlapped.map((item) => item.id).join(", ")}`);
+    }
+    const blockingIssues = openIssues(db, tune.id).filter((issue) => issueOverlapsRange(db, issue, startBeat, endBeat));
+    if (blockingIssues.length) {
+      reasons.push(`范围内仍有未解决问题：${blockingIssues.map((item) => item.id).join(", ")}`);
+    }
+    const pendingReview = db.batches.filter((item) => item.tuneId === tune.id && item.status === "pending_review");
+    if (pendingReview.length) {
+      reasons.push(`存在待复核批次，问题全部解决后才允许生成下一批：${pendingReview.map((item) => item.id).join(", ")}`);
+    }
+    if (reasons.length) {
+      return send(res, 409, { error: "领用批次整批拒绝，原领用记录和进度不变", reasons });
+    }
+    const beats = endBeat - startBeat + 1;
+    const batch = {
+      id: makeId("batch"),
+      tuneId: tune.id,
+      startBeat,
+      endBeat,
+      widthMm,
+      beats,
+      lengthMm: body.lengthMm === undefined ? beats * MM_PER_BEAT : Number(body.lengthMm),
+      status: "issued",
+      note: body.note || "",
+      createdAt: new Date().toISOString()
+    };
+    db.batches.push(batch);
+    await writeDb(db);
+    return send(res, 201, { data: batch });
+  }
+
+  if (req.method === "GET" && pathname === "/usage") {
+    return send(res, 200, { data: buildUsage(db, searchParams.get("tuneId")) });
+  }
+
   if (req.method === "GET" && pathname === "/issues") {
     const tuneId = searchParams.get("tuneId");
     const status = searchParams.get("status");
@@ -254,6 +415,7 @@ async function handle(req, res) {
       resolvedAt: null
     };
     db.issues.push(issue);
+    refreshBatchStatuses(db, issue.tuneId);
     await writeDb(db);
     return send(res, 201, { data: issue });
   }
@@ -267,6 +429,7 @@ async function handle(req, res) {
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+    refreshBatchStatuses(db, issue.tuneId);
     await writeDb(db);
     return send(res, 200, { data: issue });
   }
